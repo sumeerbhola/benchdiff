@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -52,6 +53,7 @@ Options:
       --cpuprofile          record and write cpu profiles
       --memprofile          record and write allocation profiles
       --mutexprofile        record and write mutex contention profiles
+      --metrics   <regexp>  compare only metrics matching the regexp
   -t, --threshold <n>       exit with code 0 if all regressions are below threshold, else 1
   -p, --previous-run <time> time of previous run; skip running benches and just (re)process previous run
       --post-checkout       an optional command to run after checking out each branch to
@@ -65,7 +67,8 @@ Example invocations:
   $ benchdiff --sheets ./pkg/...
   $ benchdiff --old=master~ --new=master --threshold=0.2 ./pkg/kv ./pkg/storage/...
   $ benchdiff --new=d1fbdb2 --run=Datum --count=2 --csv ./pkg/sql/...
-  $ benchdiff --new=6299bd4 --sheets --post-checkout='dev generate go' ./pkg/workload/...`
+  $ benchdiff --new=6299bd4 --sheets --post-checkout='dev generate go' ./pkg/workload/...
+  $ benchdiff --sheets ./pkg/... --metrics "allocs/op|time/op"`
 
 // TODO: it's unclear whether G Suite Domain-wide Delegation is required for the
 // Google service account. If it is, add the following requirement to the help
@@ -132,6 +135,7 @@ func run(ctx context.Context) error {
 	var itersPerTest int
 	var cpuProfile, memProfile, mutexProfile bool
 	var threshold float64
+	var metricsPattern string
 
 	pflag.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
 	pflag.BoolVarP(&help, "help", "h", false, "")
@@ -147,6 +151,7 @@ func run(ctx context.Context) error {
 	pflag.BoolVarP(&cpuProfile, "cpuprofile", "", false, "")
 	pflag.BoolVarP(&memProfile, "memprofile", "", false, "")
 	pflag.BoolVarP(&mutexProfile, "mutexprofile", "", false, "")
+	pflag.StringVarP(&metricsPattern, "metrics", "", "", "")
 	pflag.Float64VarP(&threshold, "threshold", "t", -1, "")
 	pflag.StringVarP(&previousRun, "previous-run", "p", "", "")
 	pflag.Parse()
@@ -194,6 +199,10 @@ func run(ctx context.Context) error {
 		return err
 	}
 
+	var metricsRegexp *regexp.Regexp
+	if metricsPattern != "" {
+		metricsRegexp = regexp.MustCompile(metricsPattern)
+	}
 	// Build the benchmark suites.
 	oldSuite := makeBenchSuite(oldRef)
 	newSuite := makeBenchSuite(newRef)
@@ -243,7 +252,7 @@ func run(ctx context.Context) error {
 	logProfileLocations(&oldSuite, &newSuite, cpuProfile, memProfile, mutexProfile)
 
 	// Determine whether any tests exceeded the allowable regression threshold.
-	return checkPassing(threshold, res)
+	return checkPassing(threshold, metricsRegexp, res)
 }
 
 func runHelp(ctx context.Context) error {
@@ -461,18 +470,24 @@ func logProfileLocations(
 	}
 }
 
-func checkPassing(thresh float64, tables []*benchstat.Table) error {
+func checkPassing(thresh float64, metricsRegexp *regexp.Regexp, tables []*benchstat.Table) error {
 	if thresh < 0 {
 		return nil
 	}
 	threshPct := thresh * 100
 	for _, table := range tables {
+		skipMetric := metricsRegexp != nil && !metricsRegexp.Match([]byte(table.Metric))
 		for _, row := range table.Rows {
 			worse := row.Change == -1
 			exceededThresh := math.Abs(row.PctDelta) > threshPct
 			if worse && exceededThresh {
-				return errors.Errorf("%s regression in %s of %s exceeded threshold of %.2f%%",
-					table.Metric, row.Benchmark, row.Delta, threshPct)
+				if !skipMetric {
+					return errors.Errorf("%s regression in %s of %s exceeded threshold of %.2f%%",
+						table.Metric, row.Benchmark, row.Delta, threshPct)
+				} else {
+					fmt.Printf("ignored %s regression in %s of %s\n",
+						table.Metric, row.Benchmark, row.Delta)
+				}
 			}
 		}
 	}
